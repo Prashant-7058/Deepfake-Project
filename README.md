@@ -20,18 +20,18 @@ DeepFusion is a deep learning–powered web application that detects whether a g
 
 
 ## Setup Instructions
-- Create virtual environment
+- Create virtual environment: 
   python -m venv venv
 
-- Activate the environment
+- Activate the environment : 
   venv\Scripts\activate   # For Windows
   OR
   source venv/bin/activate   # For macOS/Linux
 
-- Install dependencies
+- Install dependencies:
   pip install -r requirements.txt
 
-- run 
+- run :
   python app.py
 
 
