@@ -8,24 +8,19 @@ from PIL import Image
 from timm import create_model
 from deepfake_model import DeepFakeModel
 import mediapipe as mp
+import gc
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cpu")
 print(device)
 
 # Load EfficientNetB4 for feature extraction
-efficientnet = create_model("efficientnet_b4", pretrained=True)
-efficientnet = torch.nn.Sequential(*list(efficientnet.children())[:-2])
-efficientnet.to(device).eval()
-
-# Load trained DeepFake detection model
-model_path = "models/cnn_lstm.pth"
-model = DeepFakeModel().to(device)
-model.load_state_dict(torch.load(model_path, map_location=device))
-model.eval()
+efficientnet = None
+model = None
+face_detector = None
 
 transform = transforms.Compose([
     transforms.Resize((224, 224)),
@@ -34,46 +29,66 @@ transform = transforms.Compose([
                          std=[0.229, 0.224, 0.225])
 ])
 
-# Initialize MediaPipe Face Detection
-mp_face_detection = mp.solutions.face_detection
-face_detector = mp_face_detection.FaceDetection(min_detection_confidence=0.5)
 
-def get_frame_count_by_duration(duration_seconds):
-    """Returns the number of frames to sample based on video duration."""
-    if duration_seconds <= 10:
-        return 30
-    elif duration_seconds <= 30:
-        return 60
-    elif duration_seconds <= 60:
-        return 100
-    elif duration_seconds <= 120:
-        return 150
-    elif duration_seconds <= 300:
-        return 200
-    elif duration_seconds <= 600:
-        return 250
-    else:
-        return 300  # max cap
+def load_models():
+    global efficientnet, model, face_detector
+
+    if efficientnet is None:
+        print("Loading EfficientNet...")
+
+        efficientnet = create_model(
+            "efficientnet_b4",
+            pretrained=True
+        )
+
+        efficientnet = torch.nn.Sequential(
+            *list(efficientnet.children())[:-2]
+        )
+
+        efficientnet.to(device)
+        efficientnet.eval()
+
+    if model is None:
+        print("Loading LSTM...")
+
+        model = DeepFakeModel().to(device)
+
+        model.load_state_dict(
+            torch.load(
+                "models/cnn_lstm.pth",
+                map_location=device
+            )
+        )
+
+        model.eval()
+
+    if face_detector is None:
+        print("Loading MediaPipe...")
+
+        mp_face_detection = mp.solutions.face_detection
+
+        face_detector = mp_face_detection.FaceDetection(
+            min_detection_confidence=0.5
+        )
+
+
+
 
 def extract_features(video_path, target_frames=40):
     cap = cv2.VideoCapture(video_path)
     frames = []
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    duration_seconds = total_frames / fps if fps > 0 else 0
+    # fps = cap.get(cv2.CAP_PROP_FPS)
+    # total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    # duration_seconds = total_frames / fps if fps > 0 else 0
 
-    # Dynamically set target_frames based on video duration
-    target_frames = get_frame_count_by_duration(duration_seconds)
+    # Fixed target frames to reduce memory usage
+    target_frames = 40
 
     step = max(1, total_frames // target_frames)
 
     frame_count = 0
     saved_frame_count = 0
-
-    # Create folder to save frames (if it doesn't exist)
-    save_folder = r"E:\T.y\DEEPFAKE 2 - Copy\frames"
-    os.makedirs(save_folder, exist_ok=True)
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -105,17 +120,28 @@ def extract_features(video_path, target_frames=40):
                         face = Image.fromarray(face)
                         face = transform(face).unsqueeze(0).to(device)
 
-                        with torch.no_grad():
+                        with torch.inference_mode():
                             feature = efficientnet(face)
                             feature = torch.mean(feature, dim=[2, 3]).cpu().numpy()[0]
 
+                        del face
+                        gc.collect()
+
                         frames.append(feature)
+                        del feature
+                        gc.collect()
+
 
         frame_count += 1
 
     cap.release()
+    del cap
+    gc.collect()
 
     video_features = np.array(frames)
+    frames.clear()
+    del frames
+    gc.collect()
     if video_features.shape[0] > target_frames:
         indices = np.linspace(0, video_features.shape[0] - 1, target_frames, dtype=int)
         video_features = video_features[indices]
@@ -127,14 +153,27 @@ def extract_features(video_path, target_frames=40):
 
 
 def predict_deepfake(video_path):
-    features = extract_features(video_path)
-    features = torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(device)
+    load_models()
+    video_features = extract_features(video_path)
 
-    with torch.no_grad():
+    features = torch.tensor(
+        video_features,
+        dtype=torch.float32
+    ).unsqueeze(0).to(device)
+
+    del video_features
+    gc.collect()
+
+    with torch.inference_mode():
         output = model(features)
         prob = torch.softmax(output, dim=1)
         confidence_score = torch.max(prob).item() * 100
         prediction = torch.argmax(prob, dim=1).item()
+
+    del features
+    del output
+    del prob
+    gc.collect()
 
     label = "Fake" if prediction == 1 else "Real"
     return label, round(confidence_score, 2)
@@ -157,16 +196,18 @@ def upload_video():
 
     try:
         label, confidence = predict_deepfake(video_path)
-        result = {
-            "label": label,
-            "confidence": confidence
-        }
+        # result = {
+        #     "label": label,
+        #     "confidence": confidence
+        # }
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
         if os.path.exists(video_path):
             os.remove(video_path)
+
+        gc.collect()
 
     return jsonify({
         "label": label,
